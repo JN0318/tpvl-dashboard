@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-import glob, os
+import os
 import plotly.graph_objects as go
 import plotly.express as px
 
@@ -98,9 +98,28 @@ def calc_headline_value(row, prefix=''):
 # ============================================================
 @st.cache_data
 def load_data():
+    # 依序嘗試多個路徑，方便本機開發與雲端部署共用同一份程式碼：
+    #   1. app.py 同層的 data/ 資料夾（部署時把 CSV 放這裡，一起推上 GitHub）
+    #   2. app.py 同層（直接放在專案根目錄也可以）
+    #   3. 使用者桌面（原本本機開發路徑，向下相容）
+    script_dir = os.path.dirname(os.path.abspath(__file__))
     desktop = os.path.join(os.path.expanduser("~"), "Desktop")
-    match_path = os.path.join(desktop, "tpvl_2025_single_match_stats.csv")
-    match_df = pd.read_csv(match_path, encoding='utf-8-sig') if os.path.exists(match_path) else None
+
+    candidate_dirs = [
+        os.path.join(script_dir, "data"),
+        script_dir,
+        desktop,
+    ]
+
+    def find_file(filename):
+        for d in candidate_dirs:
+            p = os.path.join(d, filename)
+            if os.path.exists(p):
+                return p
+        return None
+
+    match_path = find_file("tpvl_2025_v2.csv") or find_file("tpvl_2025_single_match_stats.csv")
+    match_df = pd.read_csv(match_path, encoding='utf-8-sig') if match_path else None
 
     if match_df is not None:
         match_df['球員名稱'] = match_df['球員'].astype(str).str.split('#').str[0].str.strip()
@@ -122,27 +141,37 @@ def load_data():
         sorted_ids = sorted(match_df['match_id'].unique())
         match_df['場次序號'] = match_df['match_id'].map(
             {mid: i+1 for i, mid in enumerate(sorted_ids)})
+
+        # v2 特有欄位（局數、對手、每局平均）
+        if '總局數' in match_df.columns:
+            match_df['總局數'] = pd.to_numeric(match_df['總局數'], errors='coerce')
+            for col in STAT_COLS + ['總得分']:
+                per_col = f'{col}_每局'
+                if per_col not in match_df.columns:
+                    match_df[per_col] = (match_df[col] / match_df['總局數']).round(3)
+            if '本隊勝局' in match_df.columns:
+                match_df['本隊贏'] = (
+                    pd.to_numeric(match_df['本隊勝局'], errors='coerce') >
+                    pd.to_numeric(match_df['對手勝局'], errors='coerce')
+                )
+        else:
+            match_df['總局數'] = None
+            match_df['對手'] = None
+            match_df['本隊贏'] = None
+            for col in STAT_COLS + ['總得分']:
+                match_df[f'{col}_每局'] = None
+
         match_df = match_df.fillna(0)
         match_df['headline_stat'] = match_df.apply(lambda r: calc_headline_value(r, prefix=''), axis=1)
 
-    pos_path = os.path.join(desktop, "TPVL全位置數據分析")
-    summary = {}
-    if os.path.exists(pos_path):
-        for f in glob.glob(os.path.join(pos_path, "tpvl_*.csv")):
-            if "得分王" not in f:
-                name = os.path.basename(f).replace("tpvl_","").replace(".csv","")
-                df = pd.read_csv(f)
-                if '姓名' in df.columns:
-                    df['姓名'] = df['姓名'].astype(str).str.strip()
-                summary[name] = df.fillna(0)
+    return match_df
 
-    return match_df, summary
 
 # ============================================================
 # 整季累計 + 衍生指標
 # ============================================================
 def build_season(match_df):
-    s = match_df[match_df['有上場']].groupby(['球員名稱','球隊','位置中文']).agg(
+    agg_dict = dict(
         有效出場=('match_id','nunique'),
         攻擊得分=('攻擊得分','sum'),
         攔網得分=('攔網得分','sum'),
@@ -151,10 +180,22 @@ def build_season(match_df):
         防守=('防守','sum'),
         舉球=('舉球','sum'),
         總得分=('總得分','sum'),
-    ).reset_index()
+    )
+    # v2 有局數欄位
+    has_sets = '總局數' in match_df.columns and match_df['總局數'].notna().any()
+    if has_sets:
+        agg_dict['總局數'] = ('總局數','sum')
+
+    s = match_df[match_df['有上場']].groupby(['球員名稱','球隊','位置中文']).agg(
+        **agg_dict).reset_index()
 
     for col in STAT_COLS + ['總得分']:
         s[f'場均{col}'] = (s[col] / s['有效出場']).round(2)
+        # 每局平均（v2 才有）
+        if has_sets and '總局數' in s.columns:
+            s[f'{col}_每局'] = (s[col] / s['總局數'].replace(0,1)).round(3)
+        else:
+            s[f'{col}_每局'] = s[f'場均{col}']  # 退回場均
 
     # ── 得分佔比 ─────────────────────────────────────────
     team_attack_sum = s.groupby('球隊')['攻擊得分'].sum().to_dict()
@@ -275,11 +316,73 @@ def build_half_season_trend(match_df):
 
     return pivot
 
+
+# ============================================================
+# 對戰分析（v2 限定）
+# ============================================================
+def build_opponent_analysis(match_df):
+    if '對手' not in match_df.columns or match_df['對手'].isna().all():
+        return None
+    active = match_df[
+        match_df['有上場'] &
+        match_df['對手'].notna() &
+        (match_df['對手'].astype(str) != '0')
+    ].copy()
+    per_set_cols = {f'{col}_每局均': (f'{col}_每局', 'mean')
+                   for col in STAT_COLS + ['總得分']
+                   if f'{col}_每局' in active.columns}
+    opp = active.groupby(['球員名稱','球隊','位置中文','對手']).agg(
+        對戰場次=('match_id','nunique'),
+        **per_set_cols
+    ).reset_index()
+    for col in opp.select_dtypes('float').columns:
+        opp[col] = opp[col].round(2)
+    return opp
+
+
+# ============================================================
+# 勝負分析（v2 限定）
+# ============================================================
+def build_win_loss_analysis(match_df):
+    if '本隊贏' not in match_df.columns or match_df['本隊贏'].isna().all():
+        return None
+    active = match_df[
+        match_df['有上場'] &
+        match_df['本隊贏'].notna() &
+        (match_df['本隊贏'].astype(str) != '0')
+    ].copy()
+    # 重新計算本隊贏（確保是 bool）
+    if '本隊勝局' in active.columns:
+        active['本隊贏_bool'] = (
+            pd.to_numeric(active['本隊勝局'], errors='coerce') >
+            pd.to_numeric(active['對手勝局'], errors='coerce')
+        )
+    else:
+        active['本隊贏_bool'] = active['本隊贏'].astype(bool)
+
+    stat_col = '總得分_每局' if '總得分_每局' in active.columns else 'headline_stat'
+    wl = active.groupby(['球員名稱','球隊','位置中文','本隊贏_bool'])[stat_col].mean().unstack()
+    wl = wl.rename(columns={False:'輸球每局均', True:'贏球每局均'})
+    for c in ['輸球每局均','贏球每局均']:
+        if c not in wl.columns:
+            wl[c] = 0
+    wl = wl.reset_index().rename(columns={'本隊贏_bool':'_drop'})
+    if '_drop' in wl.columns:
+        wl = wl.drop(columns=['_drop'])
+    wl['差距'] = (wl['贏球每局均'] - wl['輸球每局均']).round(2)
+    wl['贏球每局均'] = wl['贏球每局均'].round(2)
+    wl['輸球每局均'] = wl['輸球每局均'].round(2)
+    counts = active.groupby('球員名稱')['match_id'].nunique().reset_index()
+    counts.columns = ['球員名稱','有效出場']
+    wl = wl.merge(counts, on='球員名稱', how='left')
+    return wl
+
+
 # ============================================================
 # 頁面設定
 # ============================================================
 st.set_page_config(page_title="TPVL 戰力分析平台", layout="wide", page_icon="🏐")
-match_df, summary_data = load_data()
+match_df = load_data()
 
 if match_df is None:
     st.error("找不到數據檔案，請確認桌面有 tpvl_2025_single_match_stats.csv")
@@ -291,6 +394,9 @@ season_df = season_df.merge(
     trend_df[['球員名稱','前半季','後半季','變化量','變化率%','趨勢']],
     on='球員名稱', how='left'
 )
+opponent_df = build_opponent_analysis(match_df)
+win_loss_df  = build_win_loss_analysis(match_df)
+HAS_V2 = opponent_df is not None  # 是否有 v2 數據
 all_teams = sorted(TEAM_COLORS.keys())
 all_positions = ['全部位置'] + list(POS_KEY_STATS.keys())
 
@@ -385,10 +491,10 @@ with st.sidebar:
             "desc": "四隊整體戰力對決，場均數據逐項比較",
             "filters": "球隊（會在圖中標亮）",
         },
-        "球探評估": {
-            "icon": "🔍",
-            "desc": "價值四象限、上下半季趨勢、穩定度分析",
-            "filters": "位置 + 標記球員（會標亮）",
+        "球探中心": {
+            "icon": "🎯",
+            "desc": "誰值得簽？球探快速清單、對手效率、勝負關鍵",
+            "filters": "位置（全聯盟球員）",
         },
     }
 
@@ -412,10 +518,10 @@ with st.sidebar:
         </div>
         """, unsafe_allow_html=True)
 
-    # ── 卡片二：瀏覽範圍篩選（僅在會用到的頁面顯示）──────────
-    if page == "聯盟總覽":
-        # 總覽頁四隊平等並列，不應預先暗示「目前是哪一隊」
-        # 仍需提供下游程式碼所需的預設值，但不顯示/不暗示任何特定選擇
+    # ── 卡片二：瀏覽範圍篩選（依頁面決定顯示什麼）────────────
+    if page in ("聯盟總覽", "位置排行榜"):
+        # 這兩頁完全不需要瀏覽範圍卡片
+        # 位置排行榜本身有分頁，聯盟總覽靠卡片點擊
         selected_position = st.session_state.get('sb_position', '全部位置')
         selected_team = st.session_state.get('sb_team', all_teams[0])
         player_pool = season_df[season_df['球隊']==selected_team]
@@ -423,35 +529,78 @@ with st.sidebar:
             player_pool = player_pool[player_pool['位置中文']==selected_position]
         team_players = sorted(player_pool['球員名稱'].unique())
         _saved_player = st.session_state.get('sb_player')
-        selected_player = _saved_player if _saved_player in team_players else (
-            team_players[0] if team_players else None)
+        selected_player = (_saved_player
+                           if (_saved_player and _saved_player in team_players
+                               and _saved_player != '（請選擇球員）')
+                           else None)
 
-        st.markdown(f"""
-        <div style="background:{theme}10; border:1px dashed {theme}40; border-radius:12px;
-                    padding:12px 14px; font-size:12.5px; color:#777; line-height:1.7;">
-          💡 點擊下方的<b>球隊卡片</b>或<b>球員卡片</b>即可瀏覽，<br>
-          左側篩選器會在你進入其他頁面時自動同步。
-        </div>
-        """, unsafe_allow_html=True)
+        if page == "聯盟總覽":
+            st.markdown(f"""
+            <div style="background:{theme}10; border:1px dashed {theme}40; border-radius:12px;
+                        padding:12px 14px; font-size:12.5px; color:#777; line-height:1.7;">
+              💡 點擊下方的<b>球隊卡片</b>或<b>球員卡片</b>即可瀏覽，<br>
+              左側篩選器會在你進入其他頁面時自動同步。
+            </div>
+            """, unsafe_allow_html=True)
+        # 位置排行榜：完全不顯示任何瀏覽範圍卡片
+
+    elif page == "跨隊比較":
+        # 跨隊比較只需要「標記球隊」
+        with st.container(border=True):
+            _section_header("⭐", "標記球隊", theme)
+            selected_team = st.selectbox("球隊", all_teams, key='sb_team')
+            theme = TEAM_COLORS[selected_team]
+            selected_position = st.session_state.get('sb_position', '全部位置')
+            selected_player = None
+            st.caption("選中的球隊會在圖表中以金色外框標示")
     else:
+        # 判斷這頁需不需要球員選擇器
+        pages_without_player = {"球隊總覽", "球探中心"}
+        pages_without_team = {"球探中心"}
         with st.container(border=True):
             _section_header("🔍", "瀏覽範圍", theme)
 
             selected_position = st.selectbox("位置", all_positions, key='sb_position')
-            selected_team = st.selectbox("球隊", all_teams, key='sb_team')
-            theme = TEAM_COLORS[selected_team]
 
-            # 依位置篩選球員清單
+            if page not in pages_without_team:
+                selected_team = st.selectbox("球隊", all_teams, key='sb_team')
+                theme = TEAM_COLORS[selected_team]
+            else:
+                selected_team = st.session_state.get('sb_team', all_teams[0])
+                theme = TEAM_COLORS[selected_team]
+
             player_pool = season_df[season_df['球隊']==selected_team]
             if selected_position != '全部位置':
                 player_pool = player_pool[player_pool['位置中文']==selected_position]
             team_players = sorted(player_pool['球員名稱'].unique())
 
-            if team_players:
-                selected_player = st.selectbox("標記球員（圖表中標亮）", team_players, key='sb_player')
+            # 球探評估／對戰分析：球員選單應涵蓋全聯盟（球探是跨球隊找人的）
+            pages_global_player = {"球探中心"}
+            if page in pages_global_player:
+                global_pool = season_df.copy()
+                if selected_position != '全部位置':
+                    global_pool = global_pool[global_pool['位置中文']==selected_position]
+                all_players_league = sorted(global_pool['球員名稱'].unique())
+            else:
+                all_players_league = team_players
+
+            if page not in pages_without_player:
+                if all_players_league:
+                    player_options = ['（請選擇球員）'] + all_players_league
+                    _saved = st.session_state.get('sb_player')
+                    _default_idx = (player_options.index(_saved)
+                                    if _saved in player_options else 0)
+                    label = "標記球員（圖表中標亮）" if page not in pages_global_player else "標記球員（全聯盟）"
+                    _player_sel = st.selectbox(label,
+                                               player_options,
+                                               index=_default_idx,
+                                               key='sb_player')
+                    selected_player = None if _player_sel == '（請選擇球員）' else _player_sel
+                else:
+                    selected_player = None
+                    st.warning("此位置無球員")
             else:
                 selected_player = None
-                st.warning("此位置無球員")
 
             qualified_count = season_df[season_df['有效出場']>=5]
             if selected_position != '全部位置':
@@ -667,7 +816,21 @@ if page == "聯盟總覽":
 # ============================================================
 elif page == "球員個人分析":
     if selected_player is None:
-        st.warning("請先選擇球員")
+        st.title("👤 球員個人分析")
+        st.info("👈 請先在左側「瀏覽範圍」選擇球隊和球員，或從「聯盟總覽」點擊球員卡片進入。")
+        # 顯示各隊球員快速選單
+        st.subheader("各隊球員快速選擇")
+        cols = st.columns(4)
+        for i, team in enumerate(all_teams):
+            color = TEAM_COLORS[team]
+            t_players = sorted(season_df[season_df['球隊']==team]['球員名稱'].unique())
+            with cols[i]:
+                st.markdown(f"<div style='font-weight:700;color:{color};margin-bottom:6px;'>{team}</div>",
+                           unsafe_allow_html=True)
+                for p in t_players:
+                    if st.button(p, key=f"quick_{p}", use_container_width=True):
+                        pos = season_df[season_df['球員名稱']==p]['位置中文'].iloc[0]
+                        goto(page='球員個人分析', team=team, position=pos, player=p)
         st.stop()
 
     st.title(f"🏐 {selected_player} 個人分析")
@@ -702,32 +865,47 @@ elif page == "球員個人分析":
         fig_p = percentile_bar_chart(row, theme, relevant_stats)
         st.plotly_chart(fig_p, width='stretch')
 
-    # ── 每場得分走勢 ────────────────────────────────────────
+    # ── 每場走勢（依位置自動切換指標）──────────────────────────
     with col_right:
-        st.subheader("📈 整季每場得分走勢")
+        headline_label = POS_HEADLINE_LABEL.get(pos, '場均總得分')
+        trend_col = 'headline_stat' if 'headline_stat' in p_match.columns else '總得分'
+        trend_title = {
+            '自由球員': '整季每場接發+防守走勢',
+            '舉球員':   '整季每場舉球走勢',
+        }.get(pos, '整季每場得分走勢')
+
+        st.subheader(f"📈 {trend_title}")
+        st.caption(f"指標：{headline_label}（自動依位置選擇最能代表該球員的數據）")
+
         if len(p_match) == 0:
             st.info("無單場數據")
         else:
+            y_vals = p_match[trend_col]
+            avg = y_vals.mean()
+            # hover 格式
+            unit = '分' if pos not in ['自由球員','舉球員'] else ''
+            hover_tpl = f'第%{{x}}場：%{{y:.1f}}{unit}<extra></extra>'
+
             fig_l = go.Figure()
             fig_l.add_trace(go.Scatter(
-                x=p_match['場次序號'], y=p_match['總得分'],
+                x=p_match['場次序號'], y=y_vals,
                 mode='lines+markers',
                 line=dict(color=theme, width=2),
                 marker=dict(size=7, color=theme),
                 fill='tozeroy',
                 fillcolor=hex_to_rgba(theme, 0.15),
-                name='得分',
-                hovertemplate='第%{x}場：%{y}分<extra></extra>'
+                name=headline_label,
+                hovertemplate=hover_tpl
             ))
-            avg = p_match['總得分'].mean()
             fig_l.add_hline(y=avg, line_dash='dash',
                             line_color='gray', opacity=0.6,
                             annotation_text=f"場均 {avg:.1f}")
             fig_l.update_layout(
-                xaxis_title='場次', yaxis_title='得分',
+                xaxis_title='場次', yaxis_title=headline_label,
                 paper_bgcolor='rgba(0,0,0,0)',
                 plot_bgcolor='rgba(0,0,0,0.02)',
-                height=max(220, 60*len(relevant_stats)), margin=dict(l=20,r=20,t=40,b=40),
+                height=max(220, 60*len(relevant_stats)),
+                margin=dict(l=20,r=20,t=40,b=40),
                 xaxis=dict(gridcolor='rgba(0,0,0,0.08)'),
                 yaxis=dict(gridcolor='rgba(0,0,0,0.08)')
             )
@@ -735,12 +913,19 @@ elif page == "球員個人分析":
 
     # ── 位置核心指標卡片 ────────────────────────────────────
     st.subheader(f"🎯 {pos} 核心數據")
+    st.caption("每局平均" if HAS_V2 else "場均")
     key_stats = POS_KEY_STATS.get(pos, STAT_COLS)
     kc = st.columns(len(key_stats))
     for i, stat in enumerate(key_stats):
+        per_set_col = f'{stat}_每局'
+        if HAS_V2 and per_set_col in row.index:
+            val = f"{row[per_set_col]:.2f}"
+            label = f"{STAT_LABELS[stat]}（每局）"
+        else:
+            val = f"{row[f'場均{stat}']}"
+            label = f"場均{STAT_LABELS[stat]}"
         kc[i].metric(
-            f"場均{STAT_LABELS[stat]}",
-            f"{row[f'場均{stat}']}",
+            label, val,
             f"位置前{int(row.get(f'{stat}_位置百分位',0))}%"
         )
 
@@ -781,9 +966,7 @@ elif page == "球隊總覽":
         st.warning("此篩選條件下無球員數據")
         st.stop()
 
-    # ── 依位置篩選的逐場數據（球隊總覽核心修正）──────────────
-    # 若篩選了特定位置，所有「場均」比較都只計算該位置球員的貢獻，
-    # 不再混入全隊（含其他位置）的數據，避免「自由球員 vs 全隊攻擊得分」這類失真比較
+    # ── 依位置篩選的逐場數據 ────────────────────────────────
     pos_match_df = match_df[match_df['有上場']]
     if selected_position != '全部位置':
         pos_match_df = pos_match_df[pos_match_df['位置中文']==selected_position]
@@ -791,22 +974,42 @@ elif page == "球隊總覽":
     else:
         scope_label = "全隊"
 
-    # ── 球隊場均六項數據 vs 聯盟平均 ────────────────────────
-    st.subheader(f"⚔️ {scope_label}場均數據 vs 聯盟平均")
-    st.caption(f"{scope_label}球員「場均」表現總和，已校正場次數差異，可直接公平比較"
-               + ("（聯盟平均＝各隊該位置球員場均總和的平均）" if selected_position!='全部位置' else ""))
+    # v2 才有局數，用每局平均取代場均
+    use_per_set = HAS_V2 and '總局數' in pos_match_df.columns and pos_match_df['總局數'].notna().any()
+    metric_label = "每局平均" if use_per_set else "場均"
+
+    # ── 球隊數據 vs 聯盟平均 ────────────────────────────────
+    st.subheader(f"⚔️ {scope_label}{metric_label}數據 vs 聯盟平均")
+    if use_per_set:
+        st.caption(f"以「每局平均」計算（消除不同場次局數差異），比「場均」更公平。"
+                   + (f"僅計算「{selected_position}」球員的貢獻。" if selected_position!='全部位置' else ""))
+    else:
+        st.caption(f"{scope_label}球員「場均」表現總和，已校正場次數差異，可直接公平比較")
 
     league_avg = {}
     team_avg = {}
     has_data = True
+
     for col in STAT_COLS:
-        per_match = pos_match_df.groupby(['球隊','match_id'])[col].sum().reset_index()
-        if per_match.empty:
-            has_data = False
-            break
-        league_avg[col] = per_match[col].mean()
-        team_subset = per_match[per_match['球隊']==selected_team]
-        team_avg[col] = team_subset[col].mean() if not team_subset.empty else 0
+        if use_per_set:
+            # 每局平均：每場比賽加總後除以局數，再取平均
+            grp = pos_match_df.groupby(['球隊','match_id']).agg(
+                col_sum=(col,'sum'),
+                sets=('總局數','first')
+            ).reset_index()
+            grp['per_set'] = grp['col_sum'] / grp['sets'].replace(0,1)
+            if grp.empty:
+                has_data = False; break
+            league_avg[col] = grp['per_set'].mean()
+            team_subset = grp[grp['球隊']==selected_team]
+            team_avg[col] = team_subset['per_set'].mean() if not team_subset.empty else 0
+        else:
+            per_match = pos_match_df.groupby(['球隊','match_id'])[col].sum().reset_index()
+            if per_match.empty:
+                has_data = False; break
+            league_avg[col] = per_match[col].mean()
+            team_subset = per_match[per_match['球隊']==selected_team]
+            team_avg[col] = team_subset[col].mean() if not team_subset.empty else 0
 
     if not has_data:
         st.info("此篩選條件下無數據")
@@ -816,27 +1019,36 @@ elif page == "球隊總覽":
             diff = team_avg[col] - league_avg[col]
             cols_disp[i].metric(
                 STAT_LABELS[col],
-                f"{team_avg[col]:.1f}",
-                f"{diff:+.1f} vs 聯盟均",
+                f"{team_avg[col]:.2f}" if use_per_set else f"{team_avg[col]:.1f}",
+                f"{diff:+.2f} vs 聯盟均" if use_per_set else f"{diff:+.1f} vs 聯盟均",
                 delta_color="normal"
             )
 
     st.divider()
 
     # ── 六個獨立小圖 ────────────────────────────────────────
-    st.subheader(f"📊 各項數據 — 全聯盟逐項比較（{scope_label}場均，獨立刻度）")
+    st.subheader(f"📊 各項數據 — 全聯盟逐項比較（{scope_label}{metric_label}，獨立刻度）")
     st.caption("每個項目用自己的刻度，避免大數據掩蓋小數據的差距")
 
-    team_match_avg = (pos_match_df
-                      .groupby(['球隊','match_id'])[STAT_COLS].sum()
-                      .reset_index()
-                      .groupby('球隊')[STAT_COLS].mean()
-                      .reset_index())
+    if use_per_set:
+        # 每局平均版本
+        grp_all = pos_match_df.groupby(['球隊','match_id']).agg(
+            **{col: (col,'sum') for col in STAT_COLS},
+            sets=('總局數','first')
+        ).reset_index()
+        for col in STAT_COLS:
+            grp_all[col] = grp_all[col] / grp_all['sets'].replace(0,1)
+        team_match_avg = grp_all.groupby('球隊')[STAT_COLS].mean().reset_index()
+    else:
+        team_match_avg = (pos_match_df
+                          .groupby(['球隊','match_id'])[STAT_COLS].sum()
+                          .reset_index()
+                          .groupby('球隊')[STAT_COLS].mean()
+                          .reset_index())
 
     if team_match_avg.empty:
         st.info("此篩選條件下無數據")
     else:
-        # 自由球員/舉球員：只顯示相關欄位，避免顯示一堆恆為0的圖
         if selected_position != '全部位置':
             display_cols = POS_PERCENTILE_STATS.get(selected_position, STAT_COLS)
         else:
@@ -1101,320 +1313,346 @@ elif page == "跨隊比較":
                             showlegend=False)
         cols4[i].plotly_chart(fig_p, width='stretch')
 
+
 # ============================================================
-# 頁面 5：球探評估
+# 球探中心（整合球探評估 + 對戰分析）
 # ============================================================
-elif page == "球探評估":
-    st.title("🔍 球探評估面板")
-    st.caption("找出「續約必爭」「被低估的潛力股」「需要觀察的下滑球員」")
+elif page == "球探中心":
+    st.title("🎯 球探中心")
+    st.caption("整合效率排名、趨勢、穩定度、對戰表現，直接回答「這個球員值不值得簽？」")
 
-    qualified = season_df[season_df['有效出場']>=5].copy()
-    if selected_position != '全部位置':
-        qualified = qualified[qualified['位置中文']==selected_position]
+    if not HAS_V2:
+        st.info("完整球探中心需要 v2 數據，部分功能可能受限")
 
-    if qualified.empty:
-        st.warning("此篩選條件下無符合資格的球員（需出場≥5場）")
-        st.stop()
+    TEAM_LIST = list(TEAM_COLORS.keys())
 
-    # ── 四象限圖 ────────────────────────────────────────────
-    # 依位置決定 X 軸代表性指標（攻擊手=總得分，舉球員=舉球，自由球員=接發+防守）
-    if selected_position != '全部位置':
-        x_label = POS_HEADLINE_LABEL.get(selected_position, '場均總得分')
-    else:
-        x_label = '場均總得分／代表性指標（依位置自動切換）'
+    # ── 建立球探核心數據表 ─────────────────────────────────────
+    @st.cache_data
+    def build_scout_report(_match_df, _season_df):
+        active = _match_df[_match_df['有上場']].copy()
+        qualified = _season_df[_season_df['有效出場']>=5].copy()
 
-    st.subheader(f"🎯 價值四象限：{x_label} vs 同位置綜合百分位")
-    st.caption("橫軸＝知名度／代表性數據（依位置自動切換：攻擊手看總得分，舉球員看舉球，自由球員看接發+防守），"
-               "縱軸＝實際效率（同位置排名）。"
-               "左上＝被低估的潛力股，右上＝續約必爭的明星，"
-               "右下＝高數據但效率一般，左下＝表現平平")
-    if selected_position == '全部位置':
-        st.caption("⚠️ 目前未篩選位置，X 軸混合了不同位置的代表性指標（自由球員看接發+防守、舉球員看舉球、"
-                   "其他看總得分），跨位置直接比較數值大小本身意義有限，建議搭配位置篩選使用")
-    st.caption("💡 為避免標籤重疊，僅標示「被低估潛力股」「效率/知名度前5」與你在左側標記的球員；"
-               "其他球員可滑鼠移過去查看詳細數據")
-
-    x_med = qualified['headline_value'].median()
-    y_med = qualified['綜合位置百分位'].median()
-
-    # ── 計算需要顯示文字標籤的球員：避免全部標籤擠成一團 ──────
-    # 規則：被低估潛力股 + 效率前5名 + 知名度前5名 + 使用者標記的球員，才顯示名字
-    gems_mask = (qualified['headline_value'] < x_med) & (qualified['綜合位置百分位'] > y_med)
-    top_eff = qualified.nlargest(5, '綜合位置百分位')['球員名稱'].tolist()
-    top_known = qualified.nlargest(5, 'headline_value')['球員名稱'].tolist()
-    label_names = set(qualified[gems_mask]['球員名稱']) | set(top_eff) | set(top_known)
-    if selected_player:
-        label_names.add(selected_player)
-
-    fig_q = go.Figure()
-    for team, color in TEAM_COLORS.items():
-        t_df = qualified[qualified['球隊']==team]
-        if t_df.empty: continue
-        text_labels = [n if n in label_names else '' for n in t_df['球員名稱']]
-        fig_q.add_trace(go.Scatter(
-            x=t_df['headline_value'], y=t_df['綜合位置百分位'],
-            mode='markers+text',
-            text=text_labels, textposition='top center',
-            textfont=dict(size=10),
-            marker=dict(size=12, color=color, line=dict(width=1, color='white')),
-            name=team,
-            customdata=t_df[['球員名稱','位置中文','球員角色','有效出場','headline_label']],
-            hovertemplate='<b>%{customdata[0]}</b><br>%{customdata[4]}：%{x:.1f}<br>位置百分位：%{y:.0f}th'
-                          '<br>位置：%{customdata[1]}<br>角色：%{customdata[2]}'
-                          '<br>出場：%{customdata[3]}場<extra></extra>'
-        ))
-
-    # ── 標記球員：加上金色星形外框 + 放大顯示名字 ─────────────
-    if selected_player and selected_player in qualified['球員名稱'].values:
-        hl = qualified[qualified['球員名稱']==selected_player].iloc[0]
-        fig_q.add_trace(go.Scatter(
-            x=[hl['headline_value']], y=[hl['綜合位置百分位']],
-            mode='markers+text',
-            text=[f"⭐ {selected_player}"], textposition='top center',
-            textfont=dict(size=14, color='#B8860B', family='Arial Black'),
-            marker=dict(size=22, color='rgba(255,215,0,0.35)',
-                        line=dict(width=3, color='#FFD700'), symbol='star'),
-            name='已標記',
-            showlegend=False,
-            hovertemplate=f'<b>⭐ {selected_player}</b><br>{hl["headline_label"]}：{hl["headline_value"]:.1f}'
-                          f'<br>位置百分位：{hl["綜合位置百分位"]:.0f}th<extra></extra>'
-        ))
-
-    fig_q.add_vline(x=x_med, line_dash='dash', line_color='gray', opacity=0.5)
-    fig_q.add_hline(y=y_med, line_dash='dash', line_color='gray', opacity=0.5)
-
-    x_max = qualified['headline_value'].max()*1.1
-    fig_q.add_annotation(x=x_med*0.3, y=95, text="💎 被低估潛力股", showarrow=False,
-                         font=dict(size=13, color='#2E7D32'), bgcolor='rgba(46,125,50,0.1)')
-    fig_q.add_annotation(x=x_max*0.85, y=95, text="⭐ 續約必爭明星", showarrow=False,
-                         font=dict(size=13, color='#C0392B'), bgcolor='rgba(192,57,43,0.1)')
-    fig_q.add_annotation(x=x_med*0.3, y=5, text="〇 表現平平", showarrow=False,
-                         font=dict(size=13, color='#777777'), bgcolor='rgba(120,120,120,0.1)')
-    fig_q.add_annotation(x=x_max*0.85, y=5, text="⚠️ 高數據但效率一般", showarrow=False,
-                         font=dict(size=13, color='#E67E22'), bgcolor='rgba(230,126,34,0.1)')
-
-    fig_q.update_layout(
-        xaxis_title=f'{x_label}（知名度/代表性數據）',
-        yaxis_title='同位置綜合百分位（效率）',
-        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0.02)',
-        height=550, margin=dict(l=20,r=20,t=20,b=40),
-        xaxis=dict(gridcolor='rgba(0,0,0,0.08)'),
-        yaxis=dict(gridcolor='rgba(0,0,0,0.08)', range=[-5,105]),
-        legend=dict(orientation='h', y=-0.15)
-    )
-    st.plotly_chart(fig_q, width='stretch')
-
-    # ── 被低估潛力股清單 ────────────────────────────────────
-    hidden_gems = qualified[
-        (qualified['headline_value'] < x_med) & (qualified['綜合位置百分位'] > y_med)
-    ].sort_values('綜合位置百分位', ascending=False)
-
-    if not hidden_gems.empty:
-        st.markdown("#### 💎 被低估的潛力股（代表性數據不高，但同位置效率名列前茅）")
-        gems_show = hidden_gems[['球員名稱','球隊','位置中文','球員角色','有效出場',
-                    'headline_label','headline_value','綜合位置百分位']].copy()
-        gems_show = gems_show.rename(columns={
-            '球員名稱':'球員','位置中文':'位置','綜合位置百分位':'位置百分位',
-            'headline_label':'代表指標','headline_value':'數值'
-        })
-        st.dataframe(gems_show.reset_index(drop=True),
-                     width='stretch', height=min(300, 50+35*len(hidden_gems)))
-
-    st.divider()
-
-    # ── 上下半季趨勢比較 ────────────────────────────────────
-    st.subheader("📈 上下半季表現趨勢")
-    st.caption("把整季拆成前半段與後半段，比較「代表性數據」變化 — "
-               "明顯下滑可能是傷病/體能警訊，明顯進步代表上升期。"
-               "依位置自動切換：攻擊手＝總得分，舉球員＝舉球，自由球員＝接發+防守")
-    st.caption("⚠️ 注意：若球員是「中途加入」或「中途離隊」，後半季/前半季可能直接從0開始或變成0，"
-               "這種情況代表名單異動，並非真正的狀態變化")
-
-    trend_show = qualified[['球員名稱','球隊','位置中文','球員角色','headline_label',
-                            '前半季','後半季','變化量','變化率%','趨勢']].copy()
-    trend_show = trend_show.sort_values('變化量', ascending=False)
-
-    # 過濾掉幾乎沒變化的球員（避免雜訊稀釋圖表）
-    CHANGE_THRESHOLD = 1.0
-    significant = trend_show[trend_show['變化量'].abs() >= CHANGE_THRESHOLD]
-
-    # ── 主圖：對稱橫向長條圖（一眼看出誰升誰降）──────────────
-    st.markdown("#### 📊 變化幅度總覽（後半季 − 前半季）")
-    st.caption(f"僅顯示變化量 ≥ ±{CHANGE_THRESHOLD} 的球員，避免微小波動造成混淆。"
-               "滑鼠移到長條上可看該球員實際比較的是哪個指標")
-
-    if significant.empty:
-        st.info("此篩選條件下沒有變化幅度顯著的球員")
-    else:
-        bar_df = significant.sort_values('變化量')
-        colors = ['#C0392B' if v < 0 else '#2E7D32' for v in bar_df['變化量']]
-        labels = bar_df['球員名稱'] + '（' + bar_df['球隊'].str[:2] + '・' + bar_df['位置中文'] + '）'
-
-        fig_bar = go.Figure(go.Bar(
-            x=bar_df['變化量'], y=labels,
-            orientation='h', marker_color=colors,
-            text=[f"{v:+.1f}" for v in bar_df['變化量']],
-            textposition='outside',
-            customdata=bar_df[['前半季','後半季','headline_label']],
-            hovertemplate='%{y}<br>指標：%{customdata[2]}'
-                          '<br>前半季：%{customdata[0]:.1f} → 後半季：%{customdata[1]:.1f}'
-                          '<br>變化：%{x:+.1f}<extra></extra>'
-        ))
-        fig_bar.add_vline(x=0, line_color='gray', line_width=1)
-        fig_bar.update_layout(
-            paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0.02)',
-            height=max(300, 32*len(bar_df)),
-            margin=dict(l=20,r=60,t=10,b=30),
-            xaxis=dict(gridcolor='rgba(0,0,0,0.08)', title='代表性數據變化量'),
-            yaxis=dict(title='')
-        )
-        st.plotly_chart(fig_bar, width='stretch')
-
-    st.divider()
-
-    # ── 細節折線：進步 / 下滑 各取前5名，獨立配色 + 數值標籤 ──
-    QUALITATIVE = px.colors.qualitative.Set1
-
-    t1, t2, t3 = st.tabs(["📈 進步最多", "📉 下滑最多", "全部球員"])
-
-    with t1:
-        up = trend_show[trend_show['變化量']>=CHANGE_THRESHOLD].head(5)
-        if up.empty:
-            st.info("無明顯進步球員")
+        # 每局得分
+        if '總局數' in qualified.columns and pd.to_numeric(qualified['總局數'], errors='coerce').notna().any():
+            qualified = qualified.copy()
+            qualified['每局得分'] = (qualified['總得分'] / pd.to_numeric(qualified['總局數'], errors='coerce').replace(0,1)).round(2)
         else:
-            fig_up = go.Figure()
-            for i, (_, r) in enumerate(up.iterrows()):
-                color = QUALITATIVE[i % len(QUALITATIVE)]
-                fig_up.add_trace(go.Scatter(
-                    x=['前半季','後半季'], y=[r['前半季'], r['後半季']],
-                    mode='lines+markers+text', name=f"{r['球員名稱']}（{r['球隊'][:2]}・{r['headline_label'].replace('場均','')}）",
-                    line=dict(width=2.5, color=color), marker=dict(size=9, color=color),
-                    text=[f"{r['前半季']:.1f}", f"{r['後半季']:.1f}"],
+            qualified = qualified.copy()
+            qualified['每局得分'] = qualified['場均總得分']
+
+        # 同位置百分位
+        qualified = qualified.copy()
+        qualified['位置百分位'] = 0.0
+        for pos in qualified['位置中文'].unique():
+            mask = qualified['位置中文']==pos
+            qualified.loc[mask,'位置百分位'] = (
+                qualified.loc[mask,'每局得分'].rank(pct=True)*100
+            ).round(0)
+
+        # 趨勢：season_df 已經從 build_half_season_trend 合併了趨勢欄位
+        # 直接用，不重複計算，避免欄位衝突
+        has_trend = '趨勢' in qualified.columns and '趨勢變化' in qualified.columns
+        if not has_trend:
+            # fallback：自行計算
+            sorted_ids = sorted(_match_df['match_id'].unique())
+            mid_pt = len(sorted_ids)//2
+            first_half = set(sorted_ids[:mid_pt])
+            active2 = active.copy()
+            active2['期間'] = active2['match_id'].apply(
+                lambda x: '前半季' if x in first_half else '後半季')
+            stat_col2 = '總得分_每局' if '總得分_每局' in active2.columns else 'headline_stat'
+            trend_raw = active2.groupby(['球員名稱','期間'])[stat_col2].mean().unstack().fillna(0)
+            if '前半季' not in trend_raw.columns: trend_raw['前半季'] = 0.0
+            if '後半季' not in trend_raw.columns: trend_raw['後半季'] = 0.0
+            trend_raw['趨勢變化'] = (trend_raw['後半季'] - trend_raw['前半季']).round(2)
+            trend_raw['趨勢'] = trend_raw['趨勢變化'].apply(
+                lambda v: '📈 上升' if v>=1.0 else ('📉 下滑' if v<=-1.0 else '➡️ 持平'))
+            trend_df_local = trend_raw[['趨勢','趨勢變化']].reset_index()
+            qualified = qualified.merge(trend_df_local, on='球員名稱', how='left')
+
+        # 穩定度
+        stat_col = '總得分_每局' if '總得分_每局' in active.columns else 'headline_stat'
+        stab = active.groupby('球員名稱')[stat_col].agg(['mean','std']).reset_index()
+        stab.columns = ['球員名稱','_mean','_std']
+        stab['cv'] = (stab['_std'] / stab['_mean'].replace(0,1)).round(2)
+        stab['穩定度'] = stab['cv'].apply(
+            lambda x: '🟢 穩定' if x<0.5 else ('🟡 中等' if x<0.8 else '🔴 起伏大'))
+
+        # 合併穩定度
+        report = qualified.merge(stab[['球員名稱','穩定度','cv']], on='球員名稱', how='left')
+
+        # 確保欄位存在
+        if '趨勢' not in report.columns: report['趨勢'] = '➡️ 持平'
+        if '趨勢變化' not in report.columns: report['趨勢變化'] = 0.0
+        if '穩定度' not in report.columns: report['穩定度'] = '🟡 中等'
+
+        report['趨勢'] = report['趨勢'].fillna('➡️ 持平')
+        report['趨勢變化'] = report['趨勢變化'].fillna(0.0)
+        report['穩定度'] = report['穩定度'].fillna('🟡 中等')
+
+        # 球探建議
+        def rec(row):
+            pct = float(row.get('位置百分位') or 0)
+            t = str(row.get('趨勢') or '')
+            s = str(row.get('穩定度') or '')
+            if pct>=80 and '上升' in t and '穩定' in s: return '⭐ 強力推薦'
+            if pct>=70 and ('上升' in t or '穩定' in s): return '✅ 值得簽下'
+            if pct>=55 and '上升' in t: return '👀 潛力觀察'
+            if pct>=70 and '下滑' in t: return '⚠️ 謹慎評估'
+            if pct<35: return '❌ 暫不考慮'
+            return '📋 一般水準'
+
+        report['球探建議'] = report.apply(rec, axis=1)
+        return report
+
+    scout_df = build_scout_report(match_df, season_df)
+
+    # 位置篩選
+    pos_sel = selected_position if selected_position != '全部位置' else None
+    if pos_sel:
+        scout_view = scout_df[scout_df['位置中文']==pos_sel].copy()
+    else:
+        scout_view = scout_df.copy()
+
+    # ── Tab 結構 ───────────────────────────────────────────────
+    tab_list = ["📋 球探快速清單", "🎯 價值四象限", "📈 趨勢與穩定度"]
+    if HAS_V2:
+        tab_list.append("⚔️ 對手效率")
+        tab_list.append("🏆 勝負關鍵")
+    tabs = st.tabs(tab_list)
+
+    # ── Tab 1：球探快速清單 ──────────────────────────────────
+    with tabs[0]:
+        st.subheader("📋 球探快速清單")
+        st.caption("整合效率、趨勢、穩定度，直接給出建議。適合快速掃視「這季有哪些球員值得關注」。")
+
+        # 建議分類按鈕
+        all_recs = ['全部', '⭐ 強力推薦', '✅ 值得簽下', '👀 潛力觀察', '⚠️ 謹慎評估', '❌ 暫不考慮']
+        rec_filter = st.radio("篩選建議", all_recs, horizontal=True, key='scout_rec_filter')
+
+        show = scout_view.copy()
+        if rec_filter != '全部':
+            show = show[show['球探建議']==rec_filter]
+
+        if show.empty:
+            st.info("此篩選條件下無球員")
+        else:
+            # 彩色卡片
+            rec_colors = {
+                '⭐ 強力推薦': '#1B5E20',
+                '✅ 值得簽下': '#2E7D32',
+                '👀 潛力觀察': '#1565C0',
+                '⚠️ 謹慎評估': '#E65100',
+                '❌ 暫不考慮': '#757575',
+                '📋 一般水準': '#9E9E9E',
+            }
+            show_sorted = show.sort_values('位置百分位', ascending=False).reset_index(drop=True)
+            cols = st.columns(3)
+            for i, (_, r) in enumerate(show_sorted.iterrows()):
+                team_color = TEAM_COLORS.get(r['球隊'], '#888')
+                rec_color = rec_colors.get(r['球探建議'], '#888')
+                with cols[i % 3]:
+                    st.markdown(f"""
+                    <div style="border:1.5px solid {team_color}44; border-radius:12px;
+                                padding:12px 14px; margin-bottom:10px;
+                                background:rgba(255,255,255,0.7);">
+                      <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+                        <div>
+                          <div style="font-size:15px;font-weight:700;">{r['球員名稱']}</div>
+                          <div style="font-size:11px;color:#888;">{r['球隊']} · {r['位置中文']}</div>
+                        </div>
+                        <div style="background:{rec_color}; color:white; font-size:11px;
+                                    padding:3px 8px; border-radius:20px; white-space:nowrap;">
+                          {r['球探建議']}
+                        </div>
+                      </div>
+                      <div style="margin-top:8px; display:flex; gap:12px; font-size:12px;">
+                        <span>每局 <b style="color:{team_color};">{r['每局得分']:.2f}</b></span>
+                        <span>位置前 <b>{int(r['位置百分位'])}%</b></span>
+                        <span>{r.get('趨勢','')}</span>
+                        <span>{r.get('穩定度','')}</span>
+                      </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    if st.button("詳細 →", key=f"scout_goto_{r['球員名稱']}", use_container_width=True):
+                        pos = r['位置中文']
+                        goto(page='球員個人分析', team=r['球隊'], position=pos, player=r['球員名稱'])
+
+    # ── Tab 2：價值四象限 ────────────────────────────────────
+    with tabs[1]:
+        x_label = POS_HEADLINE_LABEL.get(pos_sel, '場均總得分') if pos_sel else '代表性數據（依位置切換）'
+        st.subheader(f"🎯 價值四象限")
+        st.caption(f"橫軸＝{x_label}（知名度），縱軸＝同位置效率百分位。左上＝被低估潛力股，右上＝續約必爭明星。")
+        if not pos_sel:
+            st.caption("⚠️ 建議先選位置，避免不同位置的代表性數據混在一起比較。")
+
+        q_df = scout_view[scout_view['有效出場']>=5].copy()
+        if q_df.empty:
+            st.info("無數據")
+        else:
+            x_med = q_df['headline_value'].median()
+            y_med = q_df['綜合位置百分位'].median()
+            gems_mask = (q_df['headline_value']<x_med) & (q_df['綜合位置百分位']>y_med)
+            top_eff = q_df.nlargest(5,'綜合位置百分位')['球員名稱'].tolist()
+            top_known = q_df.nlargest(5,'headline_value')['球員名稱'].tolist()
+            label_names = set(q_df[gems_mask]['球員名稱']) | set(top_eff) | set(top_known)
+            if selected_player: label_names.add(selected_player)
+
+            fig_q = go.Figure()
+            for team, color in TEAM_COLORS.items():
+                t_df = q_df[q_df['球隊']==team]
+                if t_df.empty: continue
+                text_labels = [n if n in label_names else '' for n in t_df['球員名稱']]
+                fig_q.add_trace(go.Scatter(
+                    x=t_df['headline_value'], y=t_df['綜合位置百分位'],
+                    mode='markers+text', text=text_labels, textposition='top center',
+                    textfont=dict(size=10),
+                    marker=dict(size=12, color=color, line=dict(width=1, color='white')),
+                    name=team,
+                    customdata=t_df[['球員名稱','位置中文','球探建議','有效出場','headline_label']],
+                    hovertemplate='<b>%{customdata[0]}</b><br>%{customdata[4]}：%{x:.1f}'
+                                  '<br>位置百分位：%{y:.0f}th<br>建議：%{customdata[2]}<extra></extra>'
+                ))
+            if selected_player and selected_player in q_df['球員名稱'].values:
+                hl = q_df[q_df['球員名稱']==selected_player].iloc[0]
+                fig_q.add_trace(go.Scatter(
+                    x=[hl['headline_value']], y=[hl['綜合位置百分位']],
+                    mode='markers+text', text=[f"⭐ {selected_player}"],
                     textposition='top center',
-                    textfont=dict(size=11, color=color)
+                    textfont=dict(size=14, color='#B8860B', family='Arial Black'),
+                    marker=dict(size=22, color='rgba(255,215,0,0.35)',
+                                line=dict(width=3, color='#FFD700'), symbol='star'),
+                    showlegend=False
                 ))
-            fig_up.update_layout(
-                title=f"進步最多 TOP{len(up)} — 代表性數據變化（≥{CHANGE_THRESHOLD:+}）",
+            fig_q.add_vline(x=x_med, line_dash='dash', line_color='gray', opacity=0.5)
+            fig_q.add_hline(y=y_med, line_dash='dash', line_color='gray', opacity=0.5)
+            x_max = q_df['headline_value'].max()*1.1
+            fig_q.add_annotation(x=x_med*0.3, y=95, text="💎 被低估潛力股", showarrow=False,
+                                 font=dict(size=13,color='#2E7D32'), bgcolor='rgba(46,125,50,0.1)')
+            fig_q.add_annotation(x=x_max*0.85, y=95, text="⭐ 續約必爭明星", showarrow=False,
+                                 font=dict(size=13,color='#C0392B'), bgcolor='rgba(192,57,43,0.1)')
+            fig_q.update_layout(
                 paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0.02)',
-                height=420, margin=dict(l=20,r=20,t=40,b=20),
-                yaxis=dict(gridcolor='rgba(0,0,0,0.08)', title='代表性數據'),
-                legend=dict(orientation='h', y=-0.15)
+                height=520, margin=dict(l=20,r=20,t=20,b=40),
+                xaxis=dict(gridcolor='rgba(0,0,0,0.08)', title=x_label),
+                yaxis=dict(gridcolor='rgba(0,0,0,0.08)', range=[-5,105], title='同位置效率百分位'),
+                legend=dict(orientation='h', y=-0.12)
             )
-            st.plotly_chart(fig_up, width='stretch')
-            st.dataframe(
-                up[['球員名稱','球隊','位置中文','前半季','後半季','變化量','變化率%']]
-                .rename(columns={'球員名稱':'球員','位置中文':'位置'})
-                .reset_index(drop=True),
-                width='stretch'
-            )
+            st.plotly_chart(fig_q, width='stretch')
 
-    with t2:
-        down = trend_show[trend_show['變化量']<=-CHANGE_THRESHOLD].sort_values('變化量').head(5)
-        if down.empty:
-            st.info("無明顯下滑球員")
-        else:
-            fig_down = go.Figure()
-            for i, (_, r) in enumerate(down.iterrows()):
-                color = QUALITATIVE[i % len(QUALITATIVE)]
-                fig_down.add_trace(go.Scatter(
-                    x=['前半季','後半季'], y=[r['前半季'], r['後半季']],
-                    mode='lines+markers+text', name=f"{r['球員名稱']}（{r['球隊'][:2]}・{r['headline_label'].replace('場均','')}）",
-                    line=dict(width=2.5, color=color), marker=dict(size=9, color=color),
-                    text=[f"{r['前半季']:.1f}", f"{r['後半季']:.1f}"],
-                    textposition='bottom center',
-                    textfont=dict(size=11, color=color)
+    # ── Tab 3：趨勢與穩定度 ─────────────────────────────────
+    with tabs[2]:
+        st.subheader("📈 趨勢與穩定度")
+
+        t_df = scout_view[scout_view['有效出場']>=5].copy()
+        c1, c2 = st.columns(2)
+
+        with c1:
+            st.markdown("**上升趨勢球員（後半季比前半季進步）**")
+            rising = t_df[t_df['趨勢']=='📈 上升'].sort_values('趨勢變化',ascending=False)
+            if rising.empty:
+                st.info("無")
+            else:
+                for _, r in rising.iterrows():
+                    color = TEAM_COLORS.get(r['球隊'],'#888')
+                    st.markdown(f"<span style='color:{color};font-weight:700;'>{r['球員名稱']}</span>"
+                               f"（{r['球隊'][:2]}）+{r['趨勢變化']:.1f}/局　{r.get('穩定度','')}",
+                               unsafe_allow_html=True)
+
+        with c2:
+            st.markdown("**下滑警示球員（後半季比前半季退步）**")
+            falling = t_df[t_df['趨勢']=='📉 下滑'].sort_values('趨勢變化')
+            if falling.empty:
+                st.info("無")
+            else:
+                for _, r in falling.iterrows():
+                    color = TEAM_COLORS.get(r['球隊'],'#888')
+                    st.markdown(f"<span style='color:{color};font-weight:700;'>{r['球員名稱']}</span>"
+                               f"（{r['球隊'][:2]}）{r['趨勢變化']:.1f}/局　{r.get('穩定度','')}",
+                               unsafe_allow_html=True)
+
+    # ── Tab 4：對手效率（v2 限定）───────────────────────────
+    if HAS_V2:
+        with tabs[3]:
+            st.subheader("⚔️ 對手效率")
+            st.caption("選一支對手球隊，看各球員打這隊時的每局效率排行。教練/球探參考用。")
+
+            opponent_sel = st.selectbox("選擇對手球隊", TEAM_LIST, key='scout_opp')
+            active_v2 = match_df[
+                match_df['有上場'] &
+                match_df['對手'].notna() &
+                (match_df['對手'].astype(str)!='0')
+            ].copy()
+            if pos_sel:
+                active_v2 = active_v2[active_v2['位置中文']==pos_sel]
+
+            vs_opp = active_v2[active_v2['對手']==opponent_sel].groupby(
+                ['球員名稱','球隊','位置中文'])['總得分_每局'].agg(
+                每局得分=('mean'), 對戰場次=('count')).reset_index()
+            vs_opp['每局得分'] = vs_opp['每局得分'].round(2)
+            vs_opp = vs_opp[vs_opp['對戰場次']>=3].sort_values('每局得分',ascending=False)
+
+            if vs_opp.empty:
+                st.info("對戰場次不足")
+            else:
+                colors = [TEAM_COLORS.get(t,'#888') for t in vs_opp['球隊']]
+                labels = vs_opp['球員名稱']+'（'+vs_opp['球隊'].str[:2]+'·'+vs_opp['位置中文']+'）'
+                fig_opp = go.Figure(go.Bar(
+                    x=vs_opp['每局得分'], y=labels, orientation='h',
+                    marker_color=colors,
+                    text=[f"{v:.2f}" for v in vs_opp['每局得分']],
+                    textposition='outside',
+                    hovertemplate='%{y}：%{x:.2f}/局<extra></extra>'
                 ))
-            fig_down.update_layout(
-                title=f"下滑最多 TOP{len(down)} — 代表性數據變化（≤{-CHANGE_THRESHOLD:+}）",
-                paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0.02)',
-                height=420, margin=dict(l=20,r=20,t=40,b=20),
-                yaxis=dict(gridcolor='rgba(0,0,0,0.08)', title='代表性數據'),
-                legend=dict(orientation='h', y=-0.15)
-            )
-            st.plotly_chart(fig_down, width='stretch')
-            st.dataframe(
-                down[['球員名稱','球隊','位置中文','前半季','後半季','變化量','變化率%']]
-                .rename(columns={'球員名稱':'球員','位置中文':'位置'})
-                .reset_index(drop=True),
-                width='stretch'
-            )
+                fig_opp.update_layout(
+                    title=f"打「{opponent_sel}」每局得分排行",
+                    paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0.02)',
+                    height=max(300, 30*len(vs_opp)),
+                    margin=dict(l=20,r=60,t=40,b=20),
+                    yaxis=dict(autorange='reversed'),
+                    xaxis=dict(gridcolor='rgba(0,0,0,0.08)')
+                )
+                st.plotly_chart(fig_opp, width='stretch')
 
-    with t3:
-        st.dataframe(
-            trend_show.rename(columns={'球員名稱':'球員','位置中文':'位置'})
-                      .reset_index(drop=True),
-            width='stretch', height=450
-        )
+        # ── Tab 5：勝負關鍵 ───────────────────────────────────
+        with tabs[4]:
+            st.subheader("🏆 勝負關鍵球員")
+            st.caption("贏球時和輸球時的每局表現差距越大，代表這個球員對球隊勝負影響越直接。")
 
-    st.divider()
+            if win_loss_df is not None:
+                wl = win_loss_df.copy()
+                if pos_sel:
+                    wl = wl[wl['位置中文']==pos_sel]
+                wl = wl[wl['有效出場']>=5].sort_values('差距',ascending=False)
 
-    # ── 穩定度分析 ──────────────────────────────────────────
-    st.subheader("📐 表現穩定度")
-    st.caption("變異係數越低代表表現越穩定（每場波動小），越高代表狀態起伏大。"
-               "依位置自動切換衡量指標：攻擊手看總得分，舉球員看舉球，自由球員看接發+防守")
-
-    stability = match_df[match_df['有上場']].groupby('球員名稱')['headline_stat'].agg(
-        ['mean','std']).reset_index()
-    stability.columns = ['球員名稱','headline_mean','headline_std']
-    # 平均值太接近0時，CV會失真，改用「平均值<1」直接標記為資料不足
-    stability['變異係數'] = stability.apply(
-        lambda r: round(r['headline_std']/r['headline_mean'], 2) if r['headline_mean'] >= 1 else None,
-        axis=1)
-
-    stab_merged = qualified.merge(stability[['球員名稱','變異係數']], on='球員名稱', how='left')
-    stab_valid = stab_merged[stab_merged['變異係數'].notna()].copy()
-    stab_invalid_n = len(stab_merged) - len(stab_valid)
-
-    if stab_invalid_n > 0:
-        st.caption(f"ℹ️ 已排除 {stab_invalid_n} 位代表性數據場均 < 1 的球員（數值太小，變異係數會失真）")
-
-    if stab_valid.empty:
-        st.info("此篩選條件下沒有足夠數據可計算穩定度")
-    else:
-        stab_valid['穩定度'] = stab_valid['變異係數'].apply(
-            lambda x: '🟢 穩定' if x < 0.5 else ('🟡 中等' if x < 0.8 else '🔴 起伏大'))
-
-        # 同樣只標示重點球員：最穩定前3 + 起伏最大前3 + 標記球員
-        most_stable = stab_valid.nsmallest(3, '變異係數')['球員名稱'].tolist()
-        least_stable = stab_valid.nlargest(3, '變異係數')['球員名稱'].tolist()
-        stab_label_names = set(most_stable) | set(least_stable)
-        if selected_player:
-            stab_label_names.add(selected_player)
-        stab_valid['顯示標籤'] = stab_valid['球員名稱'].apply(
-            lambda n: n if n in stab_label_names else '')
-
-        fig_stab = px.scatter(
-            stab_valid, x='headline_value', y='變異係數',
-            color='球隊', text='顯示標籤', size='有效出場',
-            color_discrete_map=TEAM_COLORS, size_max=30,
-            hover_data=['球員名稱','位置中文','球員角色','headline_label']
-        )
-        fig_stab.update_traces(textposition='top center', textfont_size=10)
-
-        # 標記球員加上星形外框
-        if selected_player and selected_player in stab_valid['球員名稱'].values:
-            hl = stab_valid[stab_valid['球員名稱']==selected_player].iloc[0]
-            fig_stab.add_trace(go.Scatter(
-                x=[hl['headline_value']], y=[hl['變異係數']],
-                mode='markers', marker=dict(size=24, color='rgba(255,215,0,0.35)',
-                                             line=dict(width=3, color='#FFD700'), symbol='star'),
-                showlegend=False, hoverinfo='skip'
-            ))
-
-        fig_stab.add_hline(y=0.5, line_dash='dash', line_color='green', opacity=0.4,
-                           annotation_text='穩定')
-        fig_stab.add_hline(y=0.8, line_dash='dash', line_color='red', opacity=0.4,
-                           annotation_text='起伏大')
-
-        x_axis_title = (POS_HEADLINE_LABEL.get(selected_position, '代表性數據')
-                        if selected_position != '全部位置'
-                        else '代表性數據（依位置自動切換）')
-        fig_stab.update_layout(
-            xaxis_title=x_axis_title, yaxis_title='變異係數（越低越穩定）',
-            paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0.02)',
-            height=480, margin=dict(l=20,r=20,t=20,b=40),
-            xaxis=dict(gridcolor='rgba(0,0,0,0.08)'),
-            yaxis=dict(gridcolor='rgba(0,0,0,0.08)')
-        )
-        st.plotly_chart(fig_stab, width='stretch')
-        st.caption("⭐ 金色星形＝你在左側標記的球員　|　僅標示最穩定/最起伏前3名與標記球員的名字")
+                if not wl.empty:
+                    fig_wl = go.Figure()
+                    for _, r in wl.iterrows():
+                        color = TEAM_COLORS.get(r['球隊'],'#888')
+                        label = f"{r['球員名稱']}（{r['球隊'][:2]}）"
+                        fig_wl.add_trace(go.Scatter(
+                            x=[r['輸球每局均'], r['贏球每局均']], y=[label, label],
+                            mode='lines', line=dict(color=color, width=2.5),
+                            showlegend=False, hoverinfo='skip'
+                        ))
+                        fig_wl.add_trace(go.Scatter(
+                            x=[r['輸球每局均']], y=[label], mode='markers',
+                            marker=dict(size=10, color='white', line=dict(width=2,color=color)),
+                            showlegend=False,
+                            hovertemplate=f"{label} 輸球：{r['輸球每局均']:.2f}/局<extra></extra>"
+                        ))
+                        fig_wl.add_trace(go.Scatter(
+                            x=[r['贏球每局均']], y=[label], mode='markers',
+                            marker=dict(size=10, color=color),
+                            showlegend=False,
+                            hovertemplate=f"{label} 贏球：{r['贏球每局均']:.2f}/局<extra></extra>"
+                        ))
+                    fig_wl.update_layout(
+                        title="○ 輸球時　● 贏球時（線段越長＝影響勝負越關鍵）",
+                        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0.02)',
+                        height=max(400, 28*len(wl)),
+                        margin=dict(l=20,r=20,t=40,b=20),
+                        yaxis=dict(autorange='reversed'),
+                        xaxis=dict(gridcolor='rgba(0,0,0,0.08)', title='每局得分')
+                    )
+                    st.plotly_chart(fig_wl, width='stretch')
